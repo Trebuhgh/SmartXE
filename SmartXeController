@@ -1,0 +1,440 @@
+package com.example.smartxecontroller
+
+import android.annotation.SuppressLint
+import android.bluetooth.*
+import android.bluetooth.le.BluetoothLeScanner
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import java.util.UUID
+
+class SmartXeController(
+    private val context: Context,
+    private val listener: Listener
+) {
+
+    interface Listener {
+        fun onAttitudeUpdated(roll: Float, pitch: Float, yaw: Float)
+        fun onStatusChanged(connected: Boolean)
+        fun onLog(msg: String)
+    }
+
+    private val TAG = "SmartXeSimple"
+
+    private val bluetoothManager: BluetoothManager? =
+        context.getSystemService(BluetoothManager::class.java)
+    private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager?.adapter
+
+    private var bluetoothGatt: BluetoothGatt? = null
+    private var txChar: BluetoothGattCharacteristic? = null
+    private var rxChar: BluetoothGattCharacteristic? = null
+
+    private var isScanning = false
+    private var isConnected = false
+
+    private val handler = Handler(Looper.getMainLooper())
+
+    // Gimbal Daten
+    private val TARGET_NAME = "SMART_XE"
+    private val SERVICE_FFD0 = UUID.fromString("0000ffd0-0000-1000-8000-00805f9b34fb")
+    private val CHAR_TX_FFD1 = UUID.fromString("0000ffd1-0000-1000-8000-00805f9b34fb")
+    private val CHAR_RX_FFD2 = UUID.fromString("0000ffd2-0000-1000-8000-00805f9b34fb")
+    private val UUID_CCCD     = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+    // ------------------------------------------------------------------------
+    // Public API
+    // ------------------------------------------------------------------------
+
+    fun isConnected(): Boolean = isConnected
+
+    @SuppressLint("MissingPermission")
+    fun startScan() {
+        if (isScanning) return
+
+        val adapter = bluetoothAdapter ?: run {
+            log("BluetoothAdapter ist null")
+            return
+        }
+
+        val scanner: BluetoothLeScanner = adapter.bluetoothLeScanner ?: run {
+            log("BluetoothLeScanner ist null")
+            return
+        }
+
+        log("Start Scan (ohne Filter, wir filtern im Callback)")
+        isScanning = true
+        scanner.startScan(scanCallback)
+    }
+
+    @SuppressLint("MissingPermission")
+    fun stopScan() {
+        stopScanInternal()
+    }
+
+    @SuppressLint("MissingPermission")
+    fun disconnect() {
+        log("disconnect()")
+        handler.removeCallbacksAndMessages(null)
+        isScanning = false
+        isConnected = false
+
+        bluetoothGatt?.close()
+        bluetoothGatt = null
+        txChar = null
+        rxChar = null
+        listener.onStatusChanged(false)
+    }
+
+    // ------------------------------------------------------------------------
+    // SMART_XE Protokoll – Frames bauen
+    // ------------------------------------------------------------------------
+
+    /**
+     * Baut einen SMART_XE Frame nach dem A5 5A Protokoll:
+     *
+     * [0]  0xA5
+     * [1]  0x5A
+     * [2]  Typ (TX: 0x03, RX: 0x01)
+     * [3]  Quelle/Ziel
+     * [4]  Funktionscode High
+     * [5]  Funktionscode Low
+     * [6]  Payload-Länge High
+     * [7]  Payload-Länge Low
+     * [8..] Payload
+     * [8+N], [9+N] Checksumme = Summe der Payload-Bytes (16-bit, big endian)
+     */
+    private fun buildSmartXeFrame(
+        functionCode: Int,
+        payload: ByteArray? = null
+    ): ByteArray {
+        val data = payload ?: ByteArray(0)
+        val len = data.size
+
+        val out = ByteArray(len + 10)
+
+        // Header für TX (entspricht di.b.g / yh.c)
+        out[0] = 0xA5.toByte()
+        out[1] = 0x5A.toByte()
+        out[2] = 0x03 // App -> Gimbal
+        out[3] = 0x01 // Gegenstelle
+
+        // Funktionscode (big endian)
+        out[4] = ((functionCode shr 8) and 0xFF).toByte()
+        out[5] = (functionCode and 0xFF).toByte()
+
+        // Payload-Länge (big endian)
+        out[6] = ((len shr 8) and 0xFF).toByte()
+        out[7] = (len and 0xFF).toByte()
+
+        // Payload
+        for (i in 0 until len) {
+            out[8 + i] = data[i]
+        }
+
+        // Checksumme über Payload
+        var sum = 0
+        for (i in 0 until len) {
+            sum += data[i].toInt() and 0xFF
+        }
+        out[8 + len] = ((sum shr 8) and 0xFF).toByte()
+        out[9 + len] = (sum and 0xFF).toByte()
+
+        return out
+    }
+
+    // ------------------------------------------------------------------------
+    // Kommandos
+    // ------------------------------------------------------------------------
+
+    /**
+     * Attitude (Roll/Pitch/Yaw) vom Gimbal abfragen (Funktionscode 0x8002).
+     * Entspricht yh.c.o() / "姿态查询".
+     *
+     * Ergebnis kommt als RX-Frame und wird in handleRxFrame geparst.
+     */
+    fun sendAttitudeQuery() {
+        val FUNCTION_ATTITUDE_QUERY = 0x8002
+        val frame = buildSmartXeFrame(
+            functionCode = FUNCTION_ATTITUDE_QUERY,
+            payload = null  // keine Payload
+        )
+        writeFrame(frame, "AttitudeQuery")
+    }
+
+    /**
+     * Erzeugt einen Joystick-Befehl:
+     * Funktionscode 0x400D ("设置摇杆方向和速度" / Set stick dir & speed).
+     *
+     * pan  < 0 = links,  > 0 = rechts, 0 = kein Pan
+     * tilt < 0 = runter, > 0 = hoch,   0 = kein Tilt
+     *
+     * Werte werden auf -255..255 begrenzt.
+     */
+    private fun makeJoystickFrame(pan: Int, tilt: Int): ByteArray {
+        val p = pan.coerceIn(-255, 255)
+        val t = tilt.coerceIn(-255, 255)
+
+        // Richtung:
+        // High-Nibble: 1 wenn pan>0 (rechts), sonst 0
+        // Low-Nibble:  1 wenn tilt>0 (hoch),  sonst 0
+        val dirByte = (((if (p > 0) 1 else 0) shl 4) or (if (t > 0) 1 else 0)).toByte()
+
+        val payload = byteArrayOf(
+            dirByte,
+            kotlin.math.abs(t).toByte(), // Tilt-Speed
+            kotlin.math.abs(p).toByte()  // Pan-Speed
+        )
+
+        val FUNCTION_JOYSTICK = 0x400D
+        return buildSmartXeFrame(
+            functionCode = FUNCTION_JOYSTICK,
+            payload = payload
+        )
+    }
+
+    /** Tilt-Schritt nach oben (+) oder unten (-), 0 = Stop. */
+    fun tiltStep(direction: Int) {
+        // Beispiel-Speed – bei Bedarf ändern (0..255)
+        val speed = when {
+            direction > 0 -> 60   // nach oben
+            direction < 0 -> -60  // nach unten
+            else -> 0             // Stop
+        }
+
+        val frame = makeJoystickFrame(
+            pan = 0,
+            tilt = speed
+        )
+        writeFrame(frame, "Joystick tiltStep dir=$direction")
+    }
+
+    /** Pan-Schritt links (-) oder rechts (+), 0 = Stop. */
+    fun panStep(direction: Int) {
+        // Beispiel-Speed – bei Bedarf ändern (0..255)
+        val speed = when {
+            direction > 0 -> 60   // rechts
+            direction < 0 -> -60  // links
+            else -> 0             // Stop
+        }
+
+        val frame = makeJoystickFrame(
+            pan = speed,
+            tilt = 0
+        )
+        writeFrame(frame, "Joystick panStep dir=$direction")
+    }
+
+    // ------------------------------------------------------------------------
+    // Scan / Connect
+    // ------------------------------------------------------------------------
+
+    private val scanCallback = object : ScanCallback() {
+
+        @SuppressLint("MissingPermission")
+        override fun onScanResult(callbackType: Int, result: ScanResult) {
+            val device = result.device
+            val name = result.scanRecord?.deviceName ?: device.name
+            val rssi = result.rssi
+
+            log("ScanResult: addr=${device.address} name=$name rssi=$rssi")
+
+            if (name != null && name.startsWith(TARGET_NAME)) {
+                log("Zielgerät gefunden: ${device.address} ($name)")
+                stopScanInternal()
+                connect(device)
+            }
+        }
+
+        override fun onScanFailed(errorCode: Int) {
+            log("onScanFailed: $errorCode")
+            isScanning = false
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun connect(device: BluetoothDevice) {
+        log("Verbinde per GATT...")
+        bluetoothGatt = device.connectGatt(context, false, gattCallback)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun stopScanInternal() {
+        if (!isScanning) return
+
+        val adapter = bluetoothAdapter ?: return
+        val scanner = adapter.bluetoothLeScanner ?: return
+
+        log("Stop Scan")
+        scanner.stopScan(scanCallback)
+        isScanning = false
+    }
+
+    // ------------------------------------------------------------------------
+    // GATT Callback
+    // ------------------------------------------------------------------------
+
+    private val gattCallback = object : BluetoothGattCallback() {
+
+        override fun onConnectionStateChange(
+            gatt: BluetoothGatt,
+            status: Int,
+            newState: Int
+        ) {
+            log("onConnectionStateChange status=$status newState=$newState")
+
+            if (newState == BluetoothProfile.STATE_CONNECTED) {
+                log("STATE_CONNECTED -> discoverServices()")
+                isConnected = true
+                listener.onStatusChanged(true)
+                gatt.discoverServices()
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                log("STATE_DISCONNECTED")
+                isConnected = false
+                listener.onStatusChanged(false)
+                handler.removeCallbacksAndMessages(null)
+                txChar = null
+                rxChar = null
+                bluetoothGatt = null
+            }
+        }
+
+        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            log("onServicesDiscovered status=$status")
+
+            for (service in gatt.services) {
+                log("Service: ${service.uuid}")
+                for (ch in service.characteristics) {
+                    log("  Char: ${ch.uuid} props=${ch.properties}")
+                }
+            }
+
+            val service = gatt.getService(SERVICE_FFD0)
+            if (service == null) {
+                log("FFD0 Service nicht gefunden")
+                return
+            }
+
+            txChar = service.getCharacteristic(CHAR_TX_FFD1)
+            rxChar = service.getCharacteristic(CHAR_RX_FFD2)
+
+            if (txChar != null) {
+                log("-> TX_CHAR gefunden (WRITE)")
+            }
+            if (rxChar != null) {
+                log("-> RX_CHAR gefunden (NOTIFY)")
+                enableNotifications(gatt, rxChar!!)
+            }
+
+            // Attitude regelmäßig anfragen
+            startAttitudeTimer()
+        }
+
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic
+        ) {
+            if (characteristic.uuid == rxChar?.uuid) {
+                val data = characteristic.value ?: return
+                handleRxFrame(data)
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun enableNotifications(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+        log("enableNotifications for ${characteristic.uuid}")
+        gatt.setCharacteristicNotification(characteristic, true)
+
+        val cccd = characteristic.getDescriptor(UUID_CCCD)
+        if (cccd != null) {
+            cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            gatt.writeDescriptor(cccd)
+        } else {
+            log("CCCD-Descriptor nicht gefunden (Notifications evtl. trotzdem aktiv)")
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Attitude Timer
+    // ------------------------------------------------------------------------
+
+    private fun startAttitudeTimer() {
+        handler.removeCallbacks(attitudeRunnable)
+        handler.post(attitudeRunnable)
+    }
+
+    private val attitudeRunnable = object : Runnable {
+        override fun run() {
+            if (isConnected && bluetoothGatt != null && txChar != null) {
+                sendAttitudeQuery()
+            }
+            handler.postDelayed(this, 1000)
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Frames senden / empfangen
+    // ------------------------------------------------------------------------
+
+    @SuppressLint("MissingPermission")
+    private fun writeFrame(data: ByteArray, what: String) {
+        val gatt = bluetoothGatt
+        val ch = txChar
+
+        if (gatt == null || ch == null) {
+            log("writeFrame: bluetoothGatt oder TX-Char ist null (nicht verbunden?)")
+            return
+        }
+
+        ch.value = data
+        val ok = gatt.writeCharacteristic(ch)
+        log("TX ($what): ${data.toHexString()} -> $ok")
+    }
+
+    private fun handleRxFrame(data: ByteArray) {
+        // Nur fürs Log:
+        log("RX Fragment: ${data.toHexString()}")
+
+        // Einfacher Parser für Attitude-Frames, basierend auf deinen Logs
+        if (data.size >= 16 &&
+            data[0] == 0xA5.toByte() &&
+            data[1] == 0x5A.toByte() &&
+            data[2] == 0x01.toByte() && // RX-Typ
+            data[3] == 0x03.toByte() &&
+            data[4] == 0x80.toByte() &&
+            data[5] == 0x02.toByte()
+        ) {
+            // Hier nutzt du weiterhin dein bisheriges Layout (10..15)
+            val rollRaw = (data[10].toInt() and 0xFF) or (data[11].toInt() shl 8)
+            val pitchRaw = (data[12].toInt() and 0xFF) or (data[13].toInt() shl 8)
+            val yawRaw = (data[14].toInt() and 0xFF) or (data[15].toInt() shl 8)
+
+            // signed 16-bit
+            val rollRawS = rollRaw.toShort().toInt()
+            val pitchRawS = pitchRaw.toShort().toInt()
+            val yawRawS = yawRaw.toShort().toInt()
+
+            val roll = rollRawS / 100f
+            val pitch = pitchRawS / 100f
+            val yaw = yawRawS / 100f
+
+            log("Attitude: rollRaw=$rollRawS pitchRaw=$pitchRawS yawRaw=$yawRawS  roll=$roll° pitch=$pitch° yaw=$yaw°")
+            listener.onAttitudeUpdated(roll, pitch, yaw)
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------------
+
+    private fun log(msg: String) {
+        Log.d(TAG, msg)
+        listener.onLog(msg)
+    }
+
+    private fun ByteArray.toHexString(): String =
+        joinToString(" ") { String.format("%02X", it) }
+}

@@ -1,0 +1,92 @@
+package com.example.smartxecontroller
+
+import android.os.Bundle
+import android.widget.Button
+import android.widget.TextView
+import androidx.appcompat.app.AppCompatActivity
+
+class MainActivity : AppCompatActivity(), SmartXeController.Listener {
+
+    private lateinit var controller: SmartXeController
+
+    private lateinit var txtStatus: TextView
+    private lateinit var txtAttitude: TextView
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        txtStatus = findViewById(R.id.txtStatus)
+        txtAttitude = findViewById(R.id.txtAttitude)
+
+        val btnConnect = findViewById<Button>(R.id.btnConnect)
+        val btnPanLeft = findViewById<Button>(R.id.btnPanLeft)
+        val btnPanRight = findViewById<Button>(R.id.btnPanRight)
+        val btnTiltUp = findViewById<Button>(R.id.btnTiltUp)
+        val btnTiltDown = findViewById<Button>(R.id.btnTiltDown)
+
+        controller = SmartXeController(this, this)
+
+        // ----------------------------
+        // Verbindung
+        // ----------------------------
+        btnConnect.setOnClickListener {
+            if (controller.isConnected()) {
+                controller.disconnect()
+            } else {
+                controller.startScan()
+            }
+        }
+
+        // ----------------------------
+        // PAN (X)
+        // ----------------------------
+        btnPanLeft.setOnTouchListener { _, event ->
+            if (event.action == 0) controller.panStep(-1)
+            if (event.action == 1) controller.panStep(0)
+            true
+        }
+
+        btnPanRight.setOnTouchListener { _, event ->
+            if (event.action == 0) controller.panStep(1)
+            if (event.action == 1) controller.panStep(0)
+            true
+        }
+
+        // ----------------------------
+        // TILT (Y)
+        // ----------------------------
+        btnTiltUp.setOnTouchListener { _, event ->
+            if (event.action == 0) controller.tiltStep(1)
+            if (event.action == 1) controller.tiltStep(0)
+            true
+        }
+
+        btnTiltDown.setOnTouchListener { _, event ->
+            if (event.action == 0) controller.tiltStep(-1)
+            if (event.action == 1) controller.tiltStep(0)
+            true
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // SmartXeController.Listener
+    // ----------------------------------------------------------------
+
+    override fun onAttitudeUpdated(roll: Float, pitch: Float, yaw: Float) {
+        runOnUiThread {
+            txtAttitude.text =
+                "Roll: %.2f°\nPitch: %.2f°\nYaw: %.2f°".format(roll, pitch, yaw)
+        }
+    }
+
+    override fun onStatusChanged(connected: Boolean) {
+        runOnUiThread {
+            txtStatus.text = if (connected) "Verbunden" else "Nicht verbunden"
+        }
+    }
+
+    override fun onLog(msg: String) {
+        // optional fürs UI – aktuell nicht angezeigt
+    }
+}
